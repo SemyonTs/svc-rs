@@ -1,0 +1,28 @@
+[package]
+name = "svc-rs"
+version = "0.0.1"
+edition = "2024"
+description = "Simple service manager for *nix"
+license = "MPL-2.0"
+authors = ["Semyon Tsarev"]
+
+
+[[bin]]
+name = "svc"
+path = "main.rs"
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+overflow-checks = false
+debug-assertions = false

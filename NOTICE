@@ -1,0 +1,13 @@
+svc-rs Copyright (c) 2026 Semyon Tsarev
+
+This project is licensed under the Mozilla Public License, version 2.0.
+A copy of the license is available in the LICENSE file.
+
+This project uses the following third-party Rust crates, distributed under
+the license terms specified below, as published on crates.io or docs.rs:
+
+  - libc  0.2  (MIT OR Apache-2.0)
+
+Copies of the MIT and Apache 2.0 license texts may be found at:
+  https://opensource.org/licenses/MIT
+  https://www.apache.org/licenses/LICENSE-2.0

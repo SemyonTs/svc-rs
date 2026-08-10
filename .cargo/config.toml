@@ -1,0 +1,11 @@
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-L/usr/lib/musl/lib",
+    "-C", "link-arg=-lc",
+]
+
+[build]
+target = "x86_64-unknown-linux-musl"
