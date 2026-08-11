@@ -14,8 +14,8 @@ use core::ffi::CStr;
 use core::mem;
 use core::ptr;
 use libc::{
-    c_char, c_int, c_long, c_void, gid_t, nfds_t, off_t, pid_t, sockaddr, sockaddr_un, socklen_t,
-    time_t, uid_t,
+    c_char, c_int, c_long, c_void, gid_t, mode_t, nfds_t, off_t, pid_t, sockaddr, sockaddr_un,
+    socklen_t, time_t, uid_t,
 };
 
 // ============================================================================
@@ -37,12 +37,16 @@ const NAME_BUF: usize = 64;
 const IO_BUF: usize = 4096;
 const CMD_BUF: usize = 512;
 const RESP_BUF: usize = 8192;
-const PASSWD_LINE: usize = 256;
+const PASSWD_BUF: usize = 4096;
+const GROUP_BUF: usize = 4096;
+const ENV_BUF: usize = 4096;
+const MAX_ENV_VARS: usize = 64;
 
 const MAX_DEPENDENCIES: usize = 16;
 const DEP_FILE_BUF: usize = 512;
 
-const LOG_LIMIT: off_t = 1_048_576; // 1 MiB
+const LOG_LIMIT: off_t = 1_048_576;
+const SUPERVISOR_LOG_LIMIT: off_t = 1_048_576;
 const POLL_TIMEOUT_MS: c_int = 500;
 const SHUTDOWN_TIMEOUT_S: i64 = 5;
 const MAX_POLL_FDS: usize = MAX_SERVICES * 2 + 2;
@@ -56,6 +60,7 @@ const BACKOFF_LONG: i64 = 60;
 
 const DEV_NULL: &[u8] = b"/dev/null\0";
 const SOCK_SUFFIX: &[u8] = b"/.control.sock";
+const SUPERVISOR_LOG_PATH: &[u8] = b"/var/log/svc-rs.log\0";
 
 const STATE_DOWN: u8 = 0;
 const STATE_RUNNING: u8 = 1;
@@ -104,6 +109,65 @@ fn is_eintr() -> bool {
 
 fn is_eagain() -> bool {
     unsafe { get_errno() == libc::EAGAIN || get_errno() == libc::EWOULDBLOCK }
+}
+
+// ============================================================================
+// Zero-cost owned file descriptor
+// ============================================================================
+
+struct OwnedFd(c_int);
+
+impl OwnedFd {
+    unsafe fn from_raw(fd: c_int) -> Self {
+        OwnedFd(fd)
+    }
+
+    fn as_raw(&self) -> c_int {
+        self.0
+    }
+
+    fn into_raw(self) -> c_int {
+        let fd = self.0;
+        core::mem::forget(self);
+        fd
+    }
+}
+
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        unsafe { close_fd(self.0) }
+    }
+}
+
+struct Pipe {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+impl Pipe {
+    unsafe fn new() -> Option<Self> {
+        let mut fds: [c_int; 2] = [-1, -1];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let read = unsafe { OwnedFd::from_raw(fds[0]) };
+        let write = unsafe { OwnedFd::from_raw(fds[1]) };
+        unsafe {
+            set_nonblock(read.as_raw());
+            set_nonblock(write.as_raw());
+            set_cloexec(read.as_raw());
+            set_cloexec(write.as_raw());
+        }
+        Some(Pipe { read, write })
+    }
+
+    fn split(mut self) -> (OwnedFd, OwnedFd) {
+        let read = unsafe { OwnedFd::from_raw(self.read.0) };
+        let write = unsafe { OwnedFd::from_raw(self.write.0) };
+        self.read.0 = -1;
+        self.write.0 = -1;
+        (read, write)
+    }
 }
 
 // ============================================================================
@@ -242,7 +306,6 @@ struct Service {
     present: bool,
     stopping: bool,
     manual_start: bool,
-    stopping_deps_checked: bool,
 
     name: [u8; NAME_BUF],
     name_len: usize,
@@ -271,14 +334,17 @@ struct Service {
     has_log: bool,
     log_pid: pid_t,
     log_state: u8,
-    log_restart_at: i64,
     log_started_at: i64,
-    log_restarts: u32,
     log_stopping: bool,
 
     uid: uid_t,
     gid: gid_t,
     has_uid: bool,
+
+    env_buf: [u8; ENV_BUF],
+    env_ptrs: [*const c_char; MAX_ENV_VARS + 1],
+    env_count: usize,
+    chroot_enabled: bool,
 }
 
 const SERVICE_EMPTY: Service = Service {
@@ -286,7 +352,6 @@ const SERVICE_EMPTY: Service = Service {
     present: false,
     stopping: false,
     manual_start: false,
-    stopping_deps_checked: false,
     name: [0; NAME_BUF],
     name_len: 0,
     dir: [0; PATH_BUF],
@@ -307,13 +372,15 @@ const SERVICE_EMPTY: Service = Service {
     has_log: false,
     log_pid: -1,
     log_state: STATE_DOWN,
-    log_restart_at: 0,
     log_started_at: 0,
-    log_restarts: 0,
     log_stopping: false,
     uid: 0,
     gid: 0,
     has_uid: false,
+    env_buf: [0; ENV_BUF],
+    env_ptrs: [ptr::null(); MAX_ENV_VARS + 1],
+    env_count: 0,
+    chroot_enabled: false,
 };
 
 impl Service {
@@ -359,7 +426,6 @@ impl Service {
 // Utility functions
 // ============================================================================
 
-
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -372,6 +438,7 @@ fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
+#[allow(deprecated)]
 fn wall_now() -> time_t {
     unsafe { libc::time(ptr::null_mut()) }
 }
@@ -497,88 +564,113 @@ fn read_file_to_buf(path: &Path, buf: &mut [u8]) -> isize {
 }
 
 // ============================================================================
-// User/Group Resolution (no_std safe)
+// Supervisor log
 // ============================================================================
 
-fn resolve_id_from_file(path: &[u8], name: &[u8], want_gid: bool) -> Option<u32> {
-    let fd = unsafe { libc::open(path.as_ptr() as *const c_char, libc::O_RDONLY) };
-    if fd < 0 {
-        return None;
+static mut SUPERVISOR_LOG_FD: c_int = -1;
+static mut SUPERVISOR_LOG_LEN: off_t = 0;
+
+unsafe fn supervisor_log_init() {
+    let fd = unsafe {
+        libc::open(
+            SUPERVISOR_LOG_PATH.as_ptr() as *const c_char,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            0o644 as mode_t,
+        )
+    };
+    if fd >= 0 {
+        unsafe { set_cloexec(fd) };
+        unsafe {
+            SUPERVISOR_LOG_LEN = libc::lseek(fd, 0, libc::SEEK_END);
+        }
+        unsafe { SUPERVISOR_LOG_FD = fd };
     }
+}
 
-    let mut buf = [0u8; PASSWD_LINE];
-    let mut found = None;
+fn supervisor_log_rotate() {
+    unsafe {
+        close_fd(SUPERVISOR_LOG_FD);
+        SUPERVISOR_LOG_FD = -1;
+        SUPERVISOR_LOG_LEN = 0;
+    }
+    let ts = wall_now();
+    let mut old = Path::from_bytes(SUPERVISOR_LOG_PATH);
+    old.push_byte(b'.');
+    old.push_u64(ts as u64);
+    unsafe { libc::rename(SUPERVISOR_LOG_PATH.as_ptr() as *const c_char, old.as_ptr()) };
+    unsafe { supervisor_log_init() };
+}
 
-    loop {
-        let nr = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if nr <= 0 {
-            break;
+fn supervisor_log(msg: &[u8]) {
+    unsafe {
+        if SUPERVISOR_LOG_FD < 0 {
+            return;
         }
-
-        let data = &buf[..nr as usize];
-        let mut line_start = 0;
-
-        while line_start < data.len() {
-            let mut line_end = line_start;
-            while line_end < data.len() && data[line_end] != b'\n' {
-                line_end += 1;
+        let ts = wall_now();
+        let mut buf = [0u8; 256];
+        let mut p = Path::new();
+        p.push_u64(ts as u64);
+        p.push(b" [svc-rs] ");
+        let prefix = p.as_bytes();
+        let max_copy = core::cmp::min(buf.len(), prefix.len() + msg.len());
+        buf[..prefix.len()].copy_from_slice(prefix);
+        let msg_len = core::cmp::min(msg.len(), max_copy - prefix.len());
+        buf[prefix.len()..prefix.len() + msg_len].copy_from_slice(&msg[..msg_len]);
+        let total = prefix.len() + msg_len;
+        if write_all(SUPERVISOR_LOG_FD, &buf[..total]) {
+            SUPERVISOR_LOG_LEN += total as off_t + 1;
+            write_all(SUPERVISOR_LOG_FD, b"\n");
+            if SUPERVISOR_LOG_LEN > SUPERVISOR_LOG_LIMIT {
+                supervisor_log_rotate();
             }
-
-            let line = &data[line_start..line_end];
-            let mut colons = 0;
-            let mut field_start = 0;
-            let mut id_val: u32 = 0;
-            let mut name_match = false;
-
-            for (i, &c) in line.iter().enumerate() {
-                if c == b':' || i == line.len() - 1 {
-                    let end_idx = if c == b':' { i } else { i + 1 };
-                    let field = &line[field_start..end_idx];
-
-                    if colons == 0 {
-                        name_match = bytes_eq(field, name);
-                    } else {
-                        let target_col = if want_gid && path.ends_with(b"group") {
-                            2
-                        } else if want_gid {
-                            3
-                        } else {
-                            2
-                        };
-
-                        if colons == target_col {
-                            let mut n: u32 = 0;
-                            for &d in field {
-                                if d >= b'0' && d <= b'9' {
-                                    n = n.saturating_mul(10).saturating_add((d - b'0') as u32);
-                                } else {
-                                    break;
-                                }
-                            }
-                            id_val = n;
-                        }
-                    }
-
-                    field_start = i + 1;
-                    colons += 1;
-                }
-            }
-
-            if name_match && colons >= 3 {
-                found = Some(id_val);
-                break;
-            }
-
-            line_start = line_end + 1;
-        }
-
-        if found.is_some() {
-            break;
         }
     }
+}
 
-    unsafe { libc::close(fd) };
-    found
+// ============================================================================
+// User/Group Resolution via libc
+// ============================================================================
+
+fn resolve_uid(name: &[u8]) -> Option<uid_t> {
+    let name_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(name) };
+    let mut pwd: libc::passwd = unsafe { mem::zeroed() };
+    let mut buf = [0u8; PASSWD_BUF];
+    let mut result: *mut libc::passwd = ptr::null_mut();
+    let ret = unsafe {
+        libc::getpwnam_r(
+            name_cstr.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if ret == 0 && !result.is_null() {
+        Some(pwd.pw_uid)
+    } else {
+        None
+    }
+}
+
+fn resolve_gid(name: &[u8]) -> Option<gid_t> {
+    let name_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(name) };
+    let mut grp: libc::group = unsafe { mem::zeroed() };
+    let mut buf = [0u8; GROUP_BUF];
+    let mut result: *mut libc::group = ptr::null_mut();
+    let ret = unsafe {
+        libc::getgrnam_r(
+            name_cstr.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if ret == 0 && !result.is_null() {
+        Some(grp.gr_gid)
+    } else {
+        None
+    }
 }
 
 fn parse_user_group(s: &mut Service) {
@@ -586,33 +678,28 @@ fn parse_user_group(s: &mut Service) {
     s.gid = 0;
     s.has_uid = false;
 
-    // Fix E0506: Copy dir bytes to local buffer to avoid borrowing `s` immutably
-    // while we need to mutate `s.uid` later.
     let mut dir_buf = [0u8; PATH_BUF];
     let dir_len = s.dir_len;
     dir_buf[..dir_len].copy_from_slice(&s.dir[..dir_len]);
     let dir = &dir_buf[..dir_len];
 
-    // Parse user
+    // user
     let mut user_path = Path::from_bytes(dir);
     user_path.push(b"/user");
     let mut ubuf = [0u8; NAME_BUF];
     let nr = read_file_to_buf(&user_path, &mut ubuf);
-
     if nr > 0 {
-        let uname = &ubuf[..nr as usize];
-        let mut end = uname.len();
-        while end > 0
-            && (uname[end - 1] == b'\n' || uname[end - 1] == b'\r' || uname[end - 1] == b' ')
+        let mut end = nr as usize;
+        while end > 0 && (ubuf[end - 1] == b'\n' || ubuf[end - 1] == b'\r' || ubuf[end - 1] == b' ')
         {
             end -= 1;
         }
-        let clean_name = &uname[..end];
-
-        if !clean_name.is_empty() {
+        if end > 0 && end < NAME_BUF - 1 {
+            ubuf[end] = 0;
+            let clean = &ubuf[..end + 1];
             let mut numeric = true;
             let mut uid_val: u32 = 0;
-            for &c in clean_name {
+            for &c in &ubuf[..end] {
                 if c >= b'0' && c <= b'9' {
                     uid_val = uid_val.saturating_mul(10).saturating_add((c - b'0') as u32);
                 } else {
@@ -620,37 +707,33 @@ fn parse_user_group(s: &mut Service) {
                     break;
                 }
             }
-
             if numeric {
                 s.uid = uid_val;
                 s.has_uid = true;
-            } else if let Some(uid) = resolve_id_from_file(b"/etc/passwd\0", clean_name, false) {
+            } else if let Some(uid) = resolve_uid(clean) {
                 s.uid = uid;
                 s.has_uid = true;
             }
         }
     }
 
-    // Parse group
+    // group
     let mut grp_path = Path::from_bytes(dir);
     grp_path.push(b"/group");
     let mut gbuf = [0u8; NAME_BUF];
     let gnr = read_file_to_buf(&grp_path, &mut gbuf);
-
     if gnr > 0 {
-        let gname = &gbuf[..gnr as usize];
-        let mut end = gname.len();
-        while end > 0
-            && (gname[end - 1] == b'\n' || gname[end - 1] == b'\r' || gname[end - 1] == b' ')
+        let mut end = gnr as usize;
+        while end > 0 && (gbuf[end - 1] == b'\n' || gbuf[end - 1] == b'\r' || gbuf[end - 1] == b' ')
         {
             end -= 1;
         }
-        let clean_gname = &gname[..end];
-
-        if !clean_gname.is_empty() {
+        if end > 0 && end < NAME_BUF - 1 {
+            gbuf[end] = 0;
+            let clean = &gbuf[..end + 1];
             let mut numeric = true;
             let mut gid_val: u32 = 0;
-            for &c in clean_gname {
+            for &c in &gbuf[..end] {
                 if c >= b'0' && c <= b'9' {
                     gid_val = gid_val.saturating_mul(10).saturating_add((c - b'0') as u32);
                 } else {
@@ -658,13 +741,177 @@ fn parse_user_group(s: &mut Service) {
                     break;
                 }
             }
-
             if numeric {
                 s.gid = gid_val;
-            } else if let Some(gid) = resolve_id_from_file(b"/etc/group\0", clean_gname, true) {
+            } else if let Some(gid) = resolve_gid(clean) {
                 s.gid = gid;
             }
         }
+    }
+}
+
+// ============================================================================
+// Environment and chroot helpers
+// ============================================================================
+
+fn read_env(s: &mut Service) {
+    let mut env_path = Path::from_bytes(s.dir_bytes());
+    env_path.push(b"/env");
+    let fd = unsafe { libc::open(env_path.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        s.env_count = 0;
+        s.env_ptrs[0] = ptr::null();
+        return;
+    }
+    let mut buf = [0u8; ENV_BUF];
+    let nr = read_all_nonblock(fd, &mut buf);
+    unsafe { close_fd(fd) };
+    if nr <= 0 {
+        s.env_count = 0;
+        s.env_ptrs[0] = ptr::null();
+        return;
+    }
+    let data = &buf[..nr as usize];
+    let mut pos = 0;
+    let mut env_pos = 0;
+    s.env_count = 0;
+    while pos < data.len() && s.env_count < MAX_ENV_VARS {
+        let mut end = pos;
+        while end < data.len() && data[end] != b'\n' && data[end] != b'\r' {
+            end += 1;
+        }
+        let mut start = pos;
+        while start < end && (data[start] == b' ' || data[start] == b'\t') {
+            start += 1;
+        }
+        let mut line_end = end;
+        while line_end > start && (data[line_end - 1] == b' ' || data[line_end - 1] == b'\t') {
+            line_end -= 1;
+        }
+        if line_end > start && data[start] != b'#' {
+            let mut eq = start;
+            while eq < line_end && data[eq] != b'=' {
+                eq += 1;
+            }
+            if eq < line_end && eq > start {
+                let key_len = eq - start;
+                let val_len = line_end - eq - 1;
+                let total_len = key_len + 1 + val_len;
+                if env_pos + total_len + 1 <= ENV_BUF {
+                    s.env_buf[env_pos..env_pos + key_len].copy_from_slice(&data[start..eq]);
+                    env_pos += key_len;
+                    s.env_buf[env_pos] = b'=';
+                    env_pos += 1;
+                    s.env_buf[env_pos..env_pos + val_len].copy_from_slice(&data[eq + 1..line_end]);
+                    env_pos += val_len;
+                    s.env_buf[env_pos] = 0;
+                    unsafe {
+                        s.env_ptrs[s.env_count] =
+                            s.env_buf.as_ptr().add(env_pos - total_len - 1) as *const c_char;
+                    }
+                    s.env_count += 1;
+                    env_pos += 1;
+                }
+            }
+        }
+        pos = end + 1;
+        while pos < data.len() && (data[pos] == b'\n' || data[pos] == b'\r') {
+            pos += 1;
+        }
+    }
+    s.env_ptrs[s.env_count] = ptr::null();
+}
+
+fn check_chroot(s: &Service) -> bool {
+    let mut root_path = Path::from_bytes(s.dir_bytes());
+    root_path.push(b"/root");
+    unsafe { libc::access(root_path.as_ptr(), libc::F_OK) == 0 }
+}
+
+fn prepare_service_env(s: &mut Service) {
+    read_env(s);
+    s.chroot_enabled = check_chroot(s);
+}
+
+// ============================================================================
+// [PATCH] Resource limits and nice
+// ============================================================================
+
+fn read_rlimit_value(s: &Service, filename: &[u8]) -> Option<libc::rlim_t> {
+    let mut path = Path::from_bytes(s.dir_bytes());
+    path.push(filename);
+    let mut buf = [0u8; 32];
+    let nr = read_file_to_buf(&path, &mut buf);
+    if nr <= 0 {
+        return None;
+    }
+    let mut val: u64 = 0;
+    let mut i = 0;
+    while i < nr as usize && i < buf.len() {
+        let c = buf[i];
+        if c >= b'0' && c <= b'9' {
+            val = val.saturating_mul(10).saturating_add((c - b'0') as u64);
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if i > 0 {
+        Some(val as libc::rlim_t)
+    } else {
+        None
+    }
+}
+
+fn read_nice_value(s: &Service) -> Option<c_int> {
+    let mut path = Path::from_bytes(s.dir_bytes());
+    path.push(b"/nice");
+    let mut buf = [0u8; 16];
+    let nr = read_file_to_buf(&path, &mut buf);
+    if nr <= 0 {
+        return None;
+    }
+    let mut val: i32 = 0;
+    let mut sign: i32 = 1;
+    let mut i = 0;
+    if buf[i] == b'-' {
+        sign = -1;
+        i += 1;
+    }
+    while i < nr as usize && i < buf.len() {
+        let c = buf[i];
+        if c >= b'0' && c <= b'9' {
+            val = val * 10 + (c - b'0') as i32;
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if i > 0 { Some(sign * val) } else { None }
+}
+
+unsafe fn apply_security_restrictions(s: &Service) {
+    macro_rules! set_rlimit {
+        ($resource:expr, $file:expr) => {
+            if let Some(val) = read_rlimit_value(s, $file) {
+                let rlim = libc::rlimit {
+                    rlim_cur: val,
+                    rlim_max: val,
+                };
+                unsafe { libc::setrlimit($resource, &rlim) };
+            }
+        };
+    }
+
+    set_rlimit!(libc::RLIMIT_CPU, b"/rlimit_cpu");
+    set_rlimit!(libc::RLIMIT_AS, b"/rlimit_as");
+    set_rlimit!(libc::RLIMIT_NOFILE, b"/rlimit_nofile");
+    set_rlimit!(libc::RLIMIT_FSIZE, b"/rlimit_fsize");
+    set_rlimit!(libc::RLIMIT_NPROC, b"/rlimit_nproc");
+    set_rlimit!(libc::RLIMIT_CORE, b"/rlimit_core");
+
+    if let Some(nice_val) = read_nice_value(s) {
+        unsafe { libc::nice(nice_val) };
     }
 }
 
@@ -673,16 +920,13 @@ fn parse_user_group(s: &mut Service) {
 // ============================================================================
 
 unsafe fn init_signal_pipe() -> c_int {
-    let mut fds: [c_int; 2] = [-1, -1];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return -1;
-    }
-    unsafe { set_nonblock(fds[0]) };
-    unsafe { set_nonblock(fds[1]) };
-    unsafe { set_cloexec(fds[0]) };
-    unsafe { set_cloexec(fds[1]) };
-    unsafe { SIG_PIPE_W = fds[1] };
-    fds[0]
+    let pipe = match unsafe { Pipe::new() } {
+        Some(p) => p,
+        None => return -1,
+    };
+    let (read, write) = pipe.split();
+    unsafe { SIG_PIPE_W = write.into_raw() };
+    read.into_raw()
 }
 
 unsafe fn set_signal_action(sig: c_int) {
@@ -698,9 +942,10 @@ unsafe fn install_signal_handlers() {
     unsafe { set_signal_action(libc::SIGTERM) };
     unsafe { set_signal_action(libc::SIGINT) };
     unsafe { set_signal_action(libc::SIGCHLD) };
+    unsafe { set_signal_action(libc::SIGHUP) };
 }
 
-fn drain_signal_pipe(sig_fd: c_int) -> bool {
+fn drain_signal_pipe(sig_fd: c_int) -> Option<c_int> {
     let mut buf = [0u8; 64];
     loop {
         let r = unsafe { libc::read(sig_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
@@ -710,12 +955,12 @@ fn drain_signal_pipe(sig_fd: c_int) -> bool {
         let n = r as usize;
         for i in 0..n {
             let sig = buf[i] as c_int;
-            if sig == libc::SIGTERM || sig == libc::SIGINT {
-                return true;
+            if sig == libc::SIGTERM || sig == libc::SIGINT || sig == libc::SIGHUP {
+                return Some(sig);
             }
         }
     }
-    false
+    None
 }
 
 // ============================================================================
@@ -920,12 +1165,123 @@ fn signal_from_name(name: &[u8]) -> c_int {
         libc::SIGALRM
     } else if bytes_eq(name, b"cont") {
         libc::SIGCONT
-    } else if bytes_eq(name, b"stop") {
-        libc::SIGSTOP
     } else {
         0
     }
 }
+
+// ============================================================================
+// Dependency graph helpers
+// ============================================================================
+
+/// Stop all running services that have at least one hard dependency not in STATE_RUNNING.
+fn stop_transitive_deps(services: &mut [Service]) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..services.len() {
+            let s = &services[i];
+            if !s.active || s.stopping || s.pid <= 0 || s.state != STATE_RUNNING {
+                continue;
+            }
+            let mut depends = false;
+            for d in 0..s.deps_count {
+                if s.deps[d].soft {
+                    continue;
+                }
+                let dep_name = &s.deps[d].name[..s.deps[d].name_len];
+                let dep_idx = find_service_by_name(services, dep_name);
+                if dep_idx == usize::MAX || services[dep_idx].state != STATE_RUNNING {
+                    depends = true;
+                    break;
+                }
+            }
+            if depends {
+                services[i].stopping = true;
+                services[i].state = STATE_STOPPING;
+                unsafe { libc::kill(-services[i].pid, libc::SIGTERM) };
+                write_status_file(&services[i]);
+                changed = true;
+            }
+        }
+    }
+}
+
+fn stop_all_in_order(services: &mut [Service]) {
+    let mut order = [0usize; MAX_SERVICES];
+    let mut remaining = [false; MAX_SERVICES];
+    let mut count = 0;
+
+    for (i, s) in services.iter().enumerate() {
+        if s.active && (s.state == STATE_RUNNING || s.state == STATE_STOPPING) {
+            remaining[i] = true;
+            count += 1;
+        }
+    }
+
+    let mut pos = 0;
+    while pos < count {
+        let mut found = false;
+        for i in 0..services.len() {
+            if !remaining[i] {
+                continue;
+            }
+            let mut ready = true;
+            for d in 0..services[i].deps_count {
+                if services[i].deps[d].soft {
+                    continue;
+                }
+                let dep_name = &services[i].deps[d].name[..services[i].deps[d].name_len];
+                let dep_idx = find_service_by_name(services, dep_name);
+                if dep_idx != usize::MAX && remaining[dep_idx] {
+                    ready = false;
+                    break;
+                }
+            }
+            if ready {
+                order[pos] = i;
+                remaining[i] = false;
+                pos += 1;
+                found = true;
+            }
+        }
+        if !found {
+            break;
+        }
+    }
+    for idx in order.iter().take(pos) {
+        let s = &mut services[*idx];
+        if s.active && s.pid > 0 {
+            unsafe { libc::kill(-s.pid, libc::SIGTERM) };
+            s.stopping = true;
+            s.state = STATE_STOPPING;
+            write_status_file(s);
+        }
+        if s.log_pid > 0 && !s.log_stopping {
+            unsafe { libc::kill(s.log_pid, libc::SIGTERM) };
+            s.log_stopping = true;
+        }
+    }
+    for i in 0..services.len() {
+        if remaining[i] && services[i].active && services[i].pid > 0 {
+            unsafe { libc::kill(-services[i].pid, libc::SIGTERM) };
+            services[i].stopping = true;
+            services[i].state = STATE_STOPPING;
+        }
+        if remaining[i]
+            && services[i].active
+            && services[i].log_pid > 0
+            && !services[i].log_stopping
+        {
+            unsafe { libc::kill(services[i].log_pid, libc::SIGTERM) };
+            services[i].log_stopping = true;
+        }
+    }
+}
+
+// ============================================================================
+// Control command handling
+// ============================================================================
 
 fn handle_signal_command(client_fd: c_int, sig_name: &[u8], arg: &[u8], services: &mut [Service]) {
     let sig = signal_from_name(sig_name);
@@ -966,48 +1322,6 @@ fn handle_signal_command(client_fd: c_int, sig_name: &[u8], arg: &[u8], services
     let mut resp = [0u8; RESP_BUF];
     let len = format_ok(&mut resp, b"signal sent\n");
     write_all(client_fd, &resp[..len]);
-}
-
-/// Reverse dependency shutdown: stop all services that depend on target_name
-fn stop_reverse_deps(services: &mut [Service], target_name: &[u8]) -> usize {
-    let mut count = 0;
-    let mut changed = true;
-
-    while changed {
-        changed = false;
-        for i in 0..services.len() {
-            if !services[i].active
-                || services[i].stopping
-                || services[i].pid <= 0
-                || services[i].stopping_deps_checked
-            {
-                continue;
-            }
-
-            let mut depends_on_target = false;
-            for d in 0..services[i].deps_count {
-                if bytes_eq(
-                    &services[i].deps[d].name[..services[i].deps[d].name_len],
-                    target_name,
-                ) {
-                    depends_on_target = true;
-                    break;
-                }
-            }
-
-            if depends_on_target {
-                services[i].stopping = true;
-                services[i].state = STATE_STOPPING;
-                services[i].stopping_deps_checked = true;
-                unsafe { libc::kill(-services[i].pid, libc::SIGTERM) };
-                write_status_file(&services[i]);
-                count += 1;
-                changed = true;
-            }
-        }
-    }
-
-    count
 }
 
 fn handle_control_command(client_fd: c_int, cmd_line: &[u8], services: &mut [Service]) {
@@ -1051,7 +1365,6 @@ fn handle_control_command(client_fd: c_int, cmd_line: &[u8], services: &mut [Ser
                 s.manual_start = true;
                 s.restart_at = 0;
                 s.stopping = false;
-                s.stopping_deps_checked = false;
                 resp_len = format_ok(&mut resp, b"starting\n");
             }
         }
@@ -1063,24 +1376,16 @@ fn handle_control_command(client_fd: c_int, cmd_line: &[u8], services: &mut [Ser
             if idx == usize::MAX {
                 resp_len = format_error(&mut resp, b"service not found\n");
             } else {
-                // Reverse dependency shutdown
-                let mut name_buf = [0u8; NAME_BUF];
-                let nlen = services[idx].name_len;
-                name_buf[..nlen].copy_from_slice(&services[idx].name[..nlen]);
-                stop_reverse_deps(services, &name_buf[..nlen]);
+                stop_transitive_deps(services);
 
                 let s = &mut services[idx];
                 s.stopping = true;
                 s.state = STATE_STOPPING;
                 if s.pid > 0 {
-                    unsafe {
-                        libc::kill(-s.pid, libc::SIGTERM);
-                    }
+                    unsafe { libc::kill(-s.pid, libc::SIGTERM) };
                 }
                 if s.log_pid > 0 {
-                    unsafe {
-                        libc::kill(s.log_pid, libc::SIGTERM);
-                    }
+                    unsafe { libc::kill(s.log_pid, libc::SIGTERM) };
                     s.log_stopping = true;
                 }
                 write_status_file(s);
@@ -1100,14 +1405,10 @@ fn handle_control_command(client_fd: c_int, cmd_line: &[u8], services: &mut [Ser
                 s.state = STATE_STOPPING;
                 s.manual_start = true;
                 if s.pid > 0 {
-                    unsafe {
-                        libc::kill(-s.pid, libc::SIGTERM);
-                    }
+                    unsafe { libc::kill(-s.pid, libc::SIGTERM) };
                 }
                 if s.log_pid > 0 {
-                    unsafe {
-                        libc::kill(s.log_pid, libc::SIGTERM);
-                    }
+                    unsafe { libc::kill(s.log_pid, libc::SIGTERM) };
                     s.log_stopping = true;
                 }
                 write_status_file(s);
@@ -1161,9 +1462,7 @@ fn handle_control_command(client_fd: c_int, cmd_line: &[u8], services: &mut [Ser
                 s.auto_start = true;
                 let mut down_path = Path::from_bytes(s.dir_bytes());
                 down_path.push(b"/down");
-                unsafe {
-                    libc::unlink(down_path.as_ptr());
-                }
+                unsafe { libc::unlink(down_path.as_ptr()) };
                 s.restart_at = mono_now();
                 s.stopping = false;
                 write_status_file(s);
@@ -1207,13 +1506,37 @@ fn handle_control_command(client_fd: c_int, cmd_line: &[u8], services: &mut [Ser
                 let s = &services[idx];
                 let mut check_path = Path::from_bytes(s.dir_bytes());
                 check_path.push(b"/check");
+
+                let mut s_clone = *s;
+                prepare_service_env(&mut s_clone);
+
                 if unsafe { libc::access(check_path.as_ptr(), libc::X_OK) } == 0 {
                     let pid = unsafe { libc::fork() };
                     if pid == 0 {
                         unsafe {
-                            libc::chdir(s.dir.as_ptr() as *const c_char);
+                            if s_clone.chroot_enabled {
+                                if libc::chroot(s_clone.dir.as_ptr() as *const c_char) != 0 {
+                                    libc::_exit(126);
+                                }
+                                libc::chdir(b"/\0".as_ptr() as *const c_char);
+                            } else {
+                                libc::chdir(s_clone.dir.as_ptr() as *const c_char);
+                            }
+                            if s_clone.has_uid {
+                                if s_clone.gid != 0 {
+                                    libc::setgid(s_clone.gid as gid_t);
+                                    libc::setgroups(1, &(s_clone.gid as gid_t) as *const gid_t);
+                                }
+                                libc::setuid(s_clone.uid as uid_t);
+                                if libc::getuid() != s_clone.uid as uid_t {
+                                    libc::_exit(125);
+                                }
+                            }
+                            // [PATCH] Apply security restrictions (rlimits, nice)
+                            apply_security_restrictions(&s_clone);
                             let argv: [*const c_char; 2] = [check_path.as_ptr(), ptr::null()];
-                            libc::execv(check_path.as_ptr(), argv.as_ptr());
+                            let envp = s_clone.env_ptrs.as_ptr();
+                            libc::execve(check_path.as_ptr(), argv.as_ptr(), envp);
                             libc::_exit(126);
                         }
                     } else if pid > 0 {
@@ -1244,6 +1567,8 @@ fn handle_control_command(client_fd: c_int, cmd_line: &[u8], services: &mut [Ser
             }
         }
     } else if bytes_eq(cmd, b"reload") {
+        supervisor_log(b"reload requested via control socket");
+        unsafe { libc::kill(libc::getpid(), libc::SIGHUP) };
         resp_len = format_ok(&mut resp, b"reload scheduled\n");
     } else if signal_from_name(cmd) != 0 {
         handle_signal_command(client_fd, cmd, arg, services);
@@ -1309,18 +1634,8 @@ fn handle_control_command(client_fd: c_int, cmd_line: &[u8], services: &mut [Ser
 }
 
 // ============================================================================
-// Logging
+// Status file
 // ============================================================================
-
-fn decode_wait_status(status: c_int) -> (u8, c_int, c_int) {
-    if (status & 0x7f) == 0 {
-        (STATE_EXITED, (status >> 8) & 0xff, 0)
-    } else if (status & 0x7f) == 0x7f {
-        (STATE_DOWN, 0, 0)
-    } else {
-        (STATE_SIGNALED, 0, status & 0x7f)
-    }
-}
 
 fn write_status_file(s: &Service) {
     let mut p = Path::from_bytes(s.dir_bytes());
@@ -1330,7 +1645,7 @@ fn write_status_file(s: &Service) {
         libc::open(
             p.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-            0o644 as libc::mode_t,
+            0o644 as mode_t,
         )
     };
     if fd < 0 {
@@ -1384,20 +1699,19 @@ fn write_status_file(s: &Service) {
     }
 }
 
-fn open_log(s: &mut Service, stream: usize) {
-    let dir = Path::from_bytes(s.dir_bytes());
-    let st = &mut s.streams[stream];
+// ============================================================================
+// Logging (service logs, rotation)
+// ============================================================================
 
-    unsafe {
-        close_fd(st.log_fd);
-    }
+fn open_log(s: &mut Service, stream: usize) {
+    let dir_path = Path::from_bytes(s.dir_bytes());
+    let st = &mut s.streams[stream];
+    unsafe { close_fd(st.log_fd) };
     st.log_fd = -1;
 
-    let mut logdir = dir;
+    let mut logdir = dir_path;
     logdir.push(b"/log");
-    unsafe {
-        libc::mkdir(logdir.as_ptr(), 0o755 as libc::mode_t);
-    }
+    unsafe { libc::mkdir(logdir.as_ptr(), 0o755 as mode_t) };
 
     let mut path = logdir;
     if stream == 0 {
@@ -1410,7 +1724,7 @@ fn open_log(s: &mut Service, stream: usize) {
         libc::open(
             path.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
-            0o644 as libc::mode_t,
+            0o644 as mode_t,
         )
     };
 
@@ -1423,39 +1737,31 @@ fn open_log(s: &mut Service, stream: usize) {
 }
 
 fn rotate_log(s: &mut Service, stream: usize) {
-    let dir = Path::from_bytes(s.dir_bytes());
-
-    {
-        let st = &mut s.streams[stream];
-        unsafe {
-            close_fd(st.log_fd);
-        }
-        st.log_fd = -1;
-        st.rotations += 1;
-    }
+    let dir_path = Path::from_bytes(s.dir_bytes());
+    let st = &mut s.streams[stream];
+    unsafe { close_fd(st.log_fd) };
+    st.log_fd = -1;
+    st.rotations += 1;
 
     let ts = wall_now();
-    let rotations = s.streams[stream].rotations;
-
+    let rotations = st.rotations;
     let suffix: &[u8] = if stream == 0 {
         b"/current.out"
     } else {
         b"/current.err"
     };
 
-    let mut src = dir;
+    let mut src = dir_path;
     src.push(suffix);
 
-    let mut arch = dir;
+    let mut arch = dir_path;
     arch.push(suffix);
     arch.push_byte(b'.');
     arch.push_u64(ts as u64);
     arch.push_byte(b'.');
     arch.push_u64(rotations as u64);
 
-    unsafe {
-        libc::rename(src.as_ptr(), arch.as_ptr());
-    }
+    unsafe { libc::rename(src.as_ptr(), arch.as_ptr()) };
 
     open_log(s, stream);
 }
@@ -1507,17 +1813,13 @@ fn drain_stream(s: &mut Service, stream: usize, buf: &mut [u8; IO_BUF]) {
                 return;
             }
         } else if r == 0 {
-            unsafe {
-                close_fd(fd);
-            }
+            unsafe { close_fd(fd) };
             s.streams[stream].read_fd = -1;
             return;
         } else if is_eagain() {
             return;
         } else {
-            unsafe {
-                close_fd(fd);
-            }
+            unsafe { close_fd(fd) };
             s.streams[stream].read_fd = -1;
             return;
         }
@@ -1571,6 +1873,8 @@ fn start_service(s: &mut Service) {
         return;
     }
 
+    prepare_service_env(s);
+
     unsafe {
         close_fd(s.streams[0].read_fd);
         close_fd(s.streams[1].read_fd);
@@ -1581,44 +1885,54 @@ fn start_service(s: &mut Service) {
     let mut out_fds: [c_int; 2] = [-1, -1];
     let mut err_fds: [c_int; 2] = [-1, -1];
 
-    let mut log_pipe_wr: c_int = -1;
     if s.has_log {
         let mut log_run = Path::from_bytes(s.dir_bytes());
         log_run.push(b"/log/run");
         if unsafe { libc::access(log_run.as_ptr(), libc::X_OK) } == 0 {
-            let mut pipe_fds: [c_int; 2] = [-1, -1];
-            if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == 0 {
-                let pipe_rd = pipe_fds[0];
-                let pipe_wr = pipe_fds[1];
+            if let Some(pipe) = unsafe { Pipe::new() } {
+                let (pipe_read, pipe_write) = pipe.split();
                 let pid = unsafe { libc::fork() };
                 if pid == 0 {
                     unsafe {
                         libc::setsid();
-                        libc::dup2(pipe_rd, 0);
-                        libc::close(pipe_rd);
-                        libc::close(pipe_wr);
+                        libc::dup2(pipe_read.as_raw(), 0);
+                        drop(pipe_read);
+                        drop(pipe_write);
                         close_from(3);
-                        libc::chdir(s.dir.as_ptr() as *const c_char);
-                        let argv: [*const c_char; 2] = [log_run.as_ptr(), ptr::null()];
-                        libc::execv(log_run.as_ptr(), argv.as_ptr());
+
+                        if s.chroot_enabled {
+                            if libc::chroot(s.dir.as_ptr() as *const c_char) != 0 {
+                                libc::_exit(126);
+                            }
+                            libc::chdir(b"/\0".as_ptr() as *const c_char);
+                            let run_path = b"/log/run\0".as_ptr() as *const c_char;
+                            // [PATCH] Apply security restrictions
+                            apply_security_restrictions(s);
+                            let argv: [*const c_char; 2] = [run_path, ptr::null()];
+                            let envp = s.env_ptrs.as_ptr();
+                            libc::execve(run_path, argv.as_ptr(), envp);
+                        } else {
+                            libc::chdir(s.dir.as_ptr() as *const c_char);
+                            // [PATCH] Apply security restrictions
+                            apply_security_restrictions(s);
+                            let argv: [*const c_char; 2] = [log_run.as_ptr(), ptr::null()];
+                            let envp = s.env_ptrs.as_ptr();
+                            libc::execve(log_run.as_ptr(), argv.as_ptr(), envp);
+                        }
                         libc::_exit(126);
                     }
                 } else if pid > 0 {
-                    unsafe { close_fd(pipe_rd) };
                     s.log_pid = pid;
                     s.log_state = STATE_RUNNING;
                     s.log_started_at = mono_now();
                     s.log_stopping = false;
-                    s.log_restarts = 0;
-                    s.log_restart_at = 0;
-                    log_pipe_wr = pipe_wr;
+                    out_fds[0] = pipe_write.into_raw();
+                    out_fds[1] = -1;
                 } else {
-                    unsafe {
-                        close_fd(pipe_rd);
-                        close_fd(pipe_wr);
-                    }
                     s.has_log = false;
                 }
+            } else {
+                s.has_log = false;
             }
         } else {
             s.has_log = false;
@@ -1626,40 +1940,50 @@ fn start_service(s: &mut Service) {
     }
 
     if !s.has_log {
-        if unsafe { libc::pipe(out_fds.as_mut_ptr()) } != 0 {
-            s.state = STATE_FAILED;
-            s.restart_at = mono_now() + BACKOFF_SHORT;
-            write_status_file(s);
-            return;
-        }
-        unsafe {
-            set_nonblock(out_fds[0]);
-            set_cloexec(out_fds[0]);
-            set_cloexec(out_fds[1]);
-        }
-
-        if unsafe { libc::pipe(err_fds.as_mut_ptr()) } != 0 {
-            unsafe {
-                close_fd(out_fds[0]);
-                close_fd(out_fds[1]);
+        let pipe_out = match unsafe { Pipe::new() } {
+            Some(p) => p,
+            None => {
+                s.state = STATE_FAILED;
+                s.restart_at = mono_now() + BACKOFF_SHORT;
+                write_status_file(s);
+                return;
             }
-            s.state = STATE_FAILED;
-            s.restart_at = mono_now() + BACKOFF_SHORT;
-            write_status_file(s);
-            return;
-        }
-        unsafe {
-            set_nonblock(err_fds[0]);
-            set_cloexec(err_fds[0]);
-            set_cloexec(err_fds[1]);
-        }
+        };
+        let (out_read, out_write) = pipe_out.split();
+        out_fds[0] = out_read.into_raw();
+        out_fds[1] = out_write.into_raw();
+
+        let pipe_err = match unsafe { Pipe::new() } {
+            Some(p) => p,
+            None => {
+                unsafe {
+                    close_fd(out_fds[0]);
+                    close_fd(out_fds[1]);
+                }
+                s.state = STATE_FAILED;
+                s.restart_at = mono_now() + BACKOFF_SHORT;
+                write_status_file(s);
+                return;
+            }
+        };
+        let (err_read, err_write) = pipe_err.split();
+        err_fds[0] = err_read.into_raw();
+        err_fds[1] = err_write.into_raw();
     }
 
     let pid = unsafe { libc::fork() };
-
     if pid == 0 {
         unsafe {
             libc::setsid();
+
+            if s.chroot_enabled {
+                if libc::chroot(s.dir.as_ptr() as *const c_char) != 0 {
+                    libc::_exit(126);
+                }
+                libc::chdir(b"/\0".as_ptr() as *const c_char);
+            } else {
+                libc::chdir(s.dir.as_ptr() as *const c_char);
+            }
 
             if s.has_uid {
                 if s.gid != 0 {
@@ -1667,12 +1991,10 @@ fn start_service(s: &mut Service) {
                     libc::setgroups(1, &(s.gid as gid_t) as *const gid_t);
                 }
                 libc::setuid(s.uid as uid_t);
-
                 if libc::getuid() != s.uid as uid_t {
                     libc::_exit(125);
                 }
             }
-
             let null = libc::open(DEV_NULL.as_ptr() as *const c_char, libc::O_RDONLY);
             if null >= 0 {
                 libc::dup2(null, 0);
@@ -1680,44 +2002,46 @@ fn start_service(s: &mut Service) {
                     libc::close(null);
                 }
             }
-
-            if log_pipe_wr >= 0 {
-                libc::dup2(log_pipe_wr, 1);
-                libc::dup2(log_pipe_wr, 2);
-                libc::close(log_pipe_wr);
+            if s.has_log {
+                libc::dup2(out_fds[0], 1);
+                libc::dup2(out_fds[0], 2);
+                libc::close(out_fds[0]);
             } else {
                 libc::dup2(out_fds[1], 1);
                 libc::dup2(err_fds[1], 2);
                 libc::close(out_fds[0]);
                 libc::close(err_fds[0]);
-                if out_fds[1] > 2 {
-                    libc::close(out_fds[1]);
-                }
-                if err_fds[1] > 2 {
-                    libc::close(err_fds[1]);
-                }
+                libc::close(out_fds[1]);
+                libc::close(err_fds[1]);
             }
-
             close_from(3);
 
-            libc::chdir(s.dir.as_ptr() as *const c_char);
+            let run_path = if s.chroot_enabled {
+                b"/run\0".as_ptr() as *const c_char
+            } else {
+                let mut run = Path::from_bytes(s.dir_bytes());
+                run.push(b"/run");
+                run.as_ptr()
+            };
 
-            let mut run = Path::from_bytes(s.dir_bytes());
-            run.push(b"/run");
+            // [PATCH] Apply security restrictions
+            apply_security_restrictions(s);
 
-            let argv: [*const c_char; 2] = [run.as_ptr(), ptr::null()];
-            libc::execv(run.as_ptr(), argv.as_ptr());
+            let argv: [*const c_char; 2] = [run_path, ptr::null()];
+            let envp = s.env_ptrs.as_ptr();
+            libc::execve(run_path, argv.as_ptr(), envp);
             libc::_exit(127);
         }
     }
 
-    if !s.has_log {
-        unsafe {
-            libc::close(out_fds[1]);
-            libc::close(err_fds[1]);
-        }
+    // Parent: close write ends
+    if s.has_log {
+        unsafe { close_fd(out_fds[0]) };
     } else {
-        unsafe { close_fd(log_pipe_wr) };
+        unsafe {
+            close_fd(out_fds[1]);
+            close_fd(err_fds[1]);
+        }
     }
 
     if pid > 0 {
@@ -1727,13 +2051,18 @@ fn start_service(s: &mut Service) {
         s.term_signal = 0;
         s.started_at = mono_now();
         s.manual_start = false;
-        if !s.has_log {
+        if s.has_log {
+            s.streams[0].read_fd = -1;
+            s.streams[1].read_fd = -1;
+        } else {
             s.streams[0].read_fd = out_fds[0];
             s.streams[1].read_fd = err_fds[0];
             open_log(s, 0);
             open_log(s, 1);
         }
         write_status_file(s);
+        supervisor_log(b"service started: ");
+        supervisor_log(s.name_bytes());
     } else {
         if !s.has_log {
             unsafe {
@@ -1745,6 +2074,8 @@ fn start_service(s: &mut Service) {
         s.state = STATE_FAILED;
         s.restart_at = mono_now() + BACKOFF_SHORT;
         write_status_file(s);
+        supervisor_log(b"fork failed for service: ");
+        supervisor_log(s.name_bytes());
     }
 }
 
@@ -1809,7 +2140,6 @@ fn add_service(services: &mut [Service], name: &[u8], dir: &Path) {
                         } else {
                             (false, clean)
                         };
-
                         let nlen = core::cmp::min(dep_name.len(), NAME_BUF - 1);
                         s.deps[di].name_len = nlen;
                         s.deps[di].name[..nlen].copy_from_slice(&dep_name[..nlen]);
@@ -1832,8 +2162,10 @@ fn add_service(services: &mut [Service], name: &[u8], dir: &Path) {
             }
 
             parse_user_group(s);
-
+            prepare_service_env(s);
             write_status_file(s);
+            supervisor_log(b"service added: ");
+            supervisor_log(name);
             return;
         }
     }
@@ -1845,43 +2177,37 @@ fn scan_services(root: &Path, services: &mut [Service]) -> bool {
         if dp.is_null() {
             return false;
         }
-
         for s in services.iter_mut() {
             if s.active {
                 s.present = false;
             }
         }
-
         loop {
             let ent = libc::readdir(dp);
             if ent.is_null() {
                 break;
             }
-
             let name = CStr::from_ptr((*ent).d_name.as_ptr()).to_bytes();
             if name.is_empty() || bytes_eq(name, b".") || bytes_eq(name, b"..") {
                 continue;
             }
-
             let mut dir = Path::from_bytes(root.as_bytes());
             dir.push(b"/");
             dir.push(name);
-
             let mut run = dir;
             run.push(b"/run");
-
             if libc::access(run.as_ptr(), libc::X_OK) == 0 {
                 let idx = find_service_by_dir(services, &dir);
                 if idx != usize::MAX {
                     services[idx].present = true;
                     services[idx].stopping = false;
                     parse_user_group(&mut services[idx]);
+                    prepare_service_env(&mut services[idx]);
                 } else {
                     add_service(services, name, &dir);
                 }
             }
         }
-
         libc::closedir(dp);
     }
     true
@@ -1891,14 +2217,34 @@ fn run_finish(s: &Service) {
     let mut finish_path = Path::from_bytes(s.dir_bytes());
     finish_path.push(b"/finish");
     if unsafe { libc::access(finish_path.as_ptr(), libc::X_OK) } == 0 {
+        let mut s_clone = *s;
+        prepare_service_env(&mut s_clone);
+
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             unsafe {
-                libc::chdir(s.dir.as_ptr() as *const c_char);
+                if s_clone.chroot_enabled {
+                    if libc::chroot(s_clone.dir.as_ptr() as *const c_char) != 0 {
+                        libc::_exit(126);
+                    }
+                    libc::chdir(b"/\0".as_ptr() as *const c_char);
+                } else {
+                    libc::chdir(s_clone.dir.as_ptr() as *const c_char);
+                }
+                if s_clone.has_uid {
+                    if s_clone.gid != 0 {
+                        libc::setgid(s_clone.gid as gid_t);
+                        libc::setgroups(1, &(s_clone.gid as gid_t) as *const gid_t);
+                    }
+                    libc::setuid(s_clone.uid as uid_t);
+                    if libc::getuid() != s_clone.uid as uid_t {
+                        libc::_exit(125);
+                    }
+                }
                 let exit_str = {
                     let mut buf = [0u8; 20];
                     let mut p = Path::new();
-                    p.push_i64(s.exit_code as i64);
+                    p.push_i64(s_clone.exit_code as i64);
                     let b = p.as_bytes();
                     let n = core::cmp::min(b.len(), 19);
                     buf[..n].copy_from_slice(&b[..n]);
@@ -1908,20 +2254,23 @@ fn run_finish(s: &Service) {
                 let sig_str = {
                     let mut buf = [0u8; 20];
                     let mut p = Path::new();
-                    p.push_i64(s.term_signal as i64);
+                    p.push_i64(s_clone.term_signal as i64);
                     let b = p.as_bytes();
                     let n = core::cmp::min(b.len(), 19);
                     buf[..n].copy_from_slice(&b[..n]);
                     buf[n] = 0;
                     buf
                 };
+                // [PATCH] Apply security restrictions
+                apply_security_restrictions(&s_clone);
                 let argv: [*const c_char; 4] = [
                     finish_path.as_ptr(),
                     exit_str.as_ptr() as *const c_char,
                     sig_str.as_ptr() as *const c_char,
                     ptr::null(),
                 ];
-                libc::execv(finish_path.as_ptr(), argv.as_ptr());
+                let envp = s_clone.env_ptrs.as_ptr();
+                libc::execve(finish_path.as_ptr(), argv.as_ptr(), envp);
                 libc::_exit(127);
             }
         }
@@ -1929,30 +2278,19 @@ fn run_finish(s: &Service) {
 }
 
 fn handle_missing_services(services: &mut [Service]) {
-    // Fix E0499: Use index-based iteration to allow passing `services` mutably
-    // to stop_reverse_deps while iterating.
     let mut i = 0;
     while i < services.len() {
         if services[i].active && !services[i].present {
-            if services[i].pid > 0 {
-                if !services[i].stopping {
-                    let mut name_buf = [0u8; NAME_BUF];
-                    let nlen = services[i].name_len;
-                    name_buf[..nlen].copy_from_slice(&services[i].name[..nlen]);
-
-                    stop_reverse_deps(services, &name_buf[..nlen]);
-
-                    unsafe {
-                        libc::kill(-services[i].pid, libc::SIGTERM);
-                    }
-                    services[i].stopping = true;
-                    services[i].state = STATE_STOPPING;
-                }
+            if services[i].pid > 0 && !services[i].stopping {
+                stop_transitive_deps(services);
+                unsafe { libc::kill(-services[i].pid, libc::SIGTERM) };
+                services[i].stopping = true;
+                services[i].state = STATE_STOPPING;
+                supervisor_log(b"stopping removed service: ");
+                supervisor_log(services[i].name_bytes());
             }
             if services[i].log_pid > 0 && !services[i].log_stopping {
-                unsafe {
-                    libc::kill(services[i].log_pid, libc::SIGTERM);
-                }
+                unsafe { libc::kill(services[i].log_pid, libc::SIGTERM) };
                 services[i].log_stopping = true;
             }
             if services[i].pid <= 0 && services[i].log_pid <= 0 {
@@ -1960,13 +2298,37 @@ fn handle_missing_services(services: &mut [Service]) {
                 services[i].active = false;
                 services[i].state = STATE_DOWN;
                 write_status_file(&services[i]);
+                supervisor_log(b"service removed: ");
+                supervisor_log(services[i].name_bytes());
             }
         }
         i += 1;
     }
 }
 
+/// If the log process dies while the main process is still running, kill the main process
+fn kill_main_on_log_death(services: &mut [Service]) {
+    for s in services.iter_mut() {
+        if s.active
+            && s.has_log
+            && s.log_pid <= 0
+            && s.pid > 0
+            && !s.stopping
+            && s.state == STATE_RUNNING
+        {
+            supervisor_log(b"log process died, stopping main service: ");
+            supervisor_log(s.name_bytes());
+            unsafe { libc::kill(-s.pid, libc::SIGTERM) };
+            s.stopping = true;
+            s.state = STATE_STOPPING;
+            write_status_file(s);
+        }
+    }
+}
+
 fn reap_children(services: &mut [Service]) {
+    let mut need_stop_deps = false;
+
     loop {
         let mut status: c_int = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status as *mut c_int, libc::WNOHANG) };
@@ -1977,15 +2339,14 @@ fn reap_children(services: &mut [Service]) {
         let t = mono_now();
         let mut handled = false;
 
+        // Check log process first
         for s in services.iter_mut() {
             if s.active && s.log_pid == pid {
                 s.log_pid = -1;
                 s.log_state = STATE_DOWN;
-                if !s.log_stopping {
-                    s.log_restart_at = t + 1;
-                } else {
-                    s.log_stopping = false;
-                }
+                s.log_stopping = false;
+                supervisor_log(b"log process exited for service: ");
+                supervisor_log(s.name_bytes());
                 handled = true;
                 break;
             }
@@ -1994,17 +2355,36 @@ fn reap_children(services: &mut [Service]) {
             continue;
         }
 
+        // Main service process
         for s in services.iter_mut() {
             if s.active && s.pid == pid {
                 s.pid = -1;
                 s.last_status = status;
-
                 let (state, exit_code, term_signal) = decode_wait_status(status);
                 s.state = state;
                 s.exit_code = exit_code;
                 s.term_signal = term_signal;
 
                 run_finish(s);
+                supervisor_log(b"service exited: ");
+                supervisor_log(s.name_bytes());
+                {
+                    let mut msg = Path::new();
+                    msg.push(b" exit=");
+                    msg.push_i64(exit_code as i64);
+                    msg.push(b" sig=");
+                    msg.push_i64(term_signal as i64);
+                    supervisor_log(msg.as_bytes());
+                }
+
+                if !s.stopping && state != STATE_RUNNING {
+                    need_stop_deps = true;
+                }
+
+                if s.log_pid > 0 && (s.stopping || state == STATE_FAILED || state == STATE_DOWN) {
+                    unsafe { libc::kill(s.log_pid, libc::SIGTERM) };
+                    s.log_stopping = true;
+                }
 
                 if s.stopping || s.once {
                     s.restart_at = i64::MAX;
@@ -2021,6 +2401,8 @@ fn reap_children(services: &mut [Service]) {
                     if s.restarts > MAX_RESTARTS_IN_WINDOW {
                         s.state = STATE_FAILED;
                         s.restart_at = i64::MAX;
+                        supervisor_log(b"service failed (too many restarts): ");
+                        supervisor_log(s.name_bytes());
                     } else {
                         let delay: i64 = if s.restarts < 5 {
                             BACKOFF_SHORT
@@ -2037,6 +2419,22 @@ fn reap_children(services: &mut [Service]) {
                 break;
             }
         }
+    }
+
+    if need_stop_deps {
+        stop_transitive_deps(services);
+    }
+
+    kill_main_on_log_death(services);
+}
+
+fn decode_wait_status(status: c_int) -> (u8, c_int, c_int) {
+    if (status & 0x7f) == 0 {
+        (STATE_EXITED, (status >> 8) & 0xff, 0)
+    } else if (status & 0x7f) == 0x7f {
+        (STATE_DOWN, 0, 0)
+    } else {
+        (STATE_SIGNALED, 0, status & 0x7f)
     }
 }
 
@@ -2055,36 +2453,16 @@ fn any_open_services(services: &[Service]) -> bool {
 }
 
 fn shutdown_services(services: &mut [Service]) {
+    supervisor_log(b"shutting down services");
     let mut buf = [0u8; IO_BUF];
 
-    for s in services.iter_mut() {
-        if s.active {
-            if s.pid > 0 {
-                unsafe {
-                    libc::kill(-s.pid, libc::SIGTERM);
-                }
-                s.stopping = true;
-                s.state = STATE_STOPPING;
-            }
-            if s.log_pid > 0 {
-                unsafe {
-                    libc::kill(s.log_pid, libc::SIGTERM);
-                }
-                s.log_stopping = true;
-            }
-            write_status_file(s);
-        }
-    }
+    stop_all_in_order(services);
 
     let deadline = mono_now() + SHUTDOWN_TIMEOUT_S;
-
     loop {
         reap_children(services);
         drain_all_once(services, &mut buf);
-        if !any_open_services(services) {
-            break;
-        }
-        if mono_now() >= deadline {
+        if !any_open_services(services) || mono_now() >= deadline {
             break;
         }
         sleep_ms(100);
@@ -2092,14 +2470,10 @@ fn shutdown_services(services: &mut [Service]) {
 
     for s in services.iter_mut() {
         if s.active && s.pid > 0 {
-            unsafe {
-                libc::kill(-s.pid, libc::SIGKILL);
-            }
+            unsafe { libc::kill(-s.pid, libc::SIGKILL) };
         }
         if s.active && s.log_pid > 0 {
-            unsafe {
-                libc::kill(s.log_pid, libc::SIGKILL);
-            }
+            unsafe { libc::kill(s.log_pid, libc::SIGKILL) };
         }
     }
 
@@ -2123,14 +2497,14 @@ fn shutdown_services(services: &mut [Service]) {
             write_status_file(s);
         }
     }
+    supervisor_log(b"shutdown complete");
 }
 
 // ============================================================================
 // Main
 // ============================================================================
 
-const SERVICES_ZERO: [Service; MAX_SERVICES] = unsafe { core::mem::zeroed() };
-static mut SERVICES: [Service; MAX_SERVICES] = SERVICES_ZERO;
+static mut SERVICES: [Service; MAX_SERVICES] = unsafe { core::mem::zeroed() };
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
@@ -2150,11 +2524,12 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         root.push(b"/etc/svc");
     }
 
+    unsafe { supervisor_log_init() };
+    supervisor_log(b"svc-rs starting");
+
     let sig_fd = unsafe { init_signal_pipe() };
     if sig_fd >= 0 {
-        unsafe {
-            install_signal_handlers();
-        }
+        unsafe { install_signal_handlers() };
     }
 
     let ctrl_fd = unsafe { create_control_socket(&root) };
@@ -2162,84 +2537,31 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     let services = unsafe { &mut *ptr::addr_of_mut!(SERVICES) };
     let mut buf = [0u8; IO_BUF];
     let mut next_scan = mono_now();
+    let mut reload_needed = false;
 
     loop {
         reap_children(services);
 
         let t = mono_now();
 
-        if t >= next_scan {
+        if t >= next_scan || reload_needed {
             let ok = scan_services(&root, services);
             if ok {
                 handle_missing_services(services);
             }
             next_scan = t + 15;
+            reload_needed = false;
+            supervisor_log(b"configuration reloaded");
         }
 
         for i in 0..MAX_SERVICES {
-            let svc_active = services[i].active;
-            let svc_present = services[i].present;
-            let svc_stopping = services[i].stopping;
-            let svc_pid = services[i].pid;
-            let svc_restart_at = services[i].restart_at;
-            let svc_manual_start = services[i].manual_start;
-            let svc_auto_start = services[i].auto_start;
-            let svc_once = services[i].once;
-
-            if svc_active && svc_present && !svc_stopping && svc_pid <= 0 && t >= svc_restart_at {
-                if svc_manual_start || (svc_auto_start && !svc_once) {
-                    if !deps_satisfied(&services[i], services) {
+            let svc = &services[i];
+            if svc.active && svc.present && !svc.stopping && svc.pid <= 0 && t >= svc.restart_at {
+                if svc.manual_start || (svc.auto_start && !svc.once) {
+                    if !deps_satisfied(svc, services) {
                         services[i].restart_at = mono_now() + 1;
                     } else {
                         start_service(&mut services[i]);
-                    }
-                }
-            }
-
-            if services[i].active
-                && services[i].has_log
-                && services[i].pid > 0
-                && services[i].state == STATE_RUNNING
-                && services[i].log_pid <= 0
-                && services[i].log_state != STATE_RUNNING
-                && t >= services[i].log_restart_at
-                && !services[i].log_stopping
-            {
-                let s = &mut services[i];
-                let mut log_run = Path::from_bytes(s.dir_bytes());
-                log_run.push(b"/log/run");
-                if unsafe { libc::access(log_run.as_ptr(), libc::X_OK) } == 0 {
-                    let mut pipe_fds: [c_int; 2] = [-1, -1];
-                    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == 0 {
-                        let pid = unsafe { libc::fork() };
-                        if pid == 0 {
-                            unsafe {
-                                libc::setsid();
-                                libc::dup2(pipe_fds[0], 0);
-                                libc::close(pipe_fds[0]);
-                                libc::close(pipe_fds[1]);
-                                close_from(3);
-                                libc::chdir(s.dir.as_ptr() as *const c_char);
-                                let argv: [*const c_char; 2] = [log_run.as_ptr(), ptr::null()];
-                                libc::execv(log_run.as_ptr(), argv.as_ptr());
-                                libc::_exit(126);
-                            }
-                        } else if pid > 0 {
-                            unsafe {
-                                close_fd(pipe_fds[0]);
-                                close_fd(pipe_fds[1]);
-                            }
-                            s.log_pid = pid;
-                            s.log_state = STATE_RUNNING;
-                            s.log_started_at = t;
-                            s.log_restarts += 1;
-                            s.log_restart_at = 0;
-                        } else {
-                            unsafe {
-                                close_fd(pipe_fds[0]);
-                                close_fd(pipe_fds[1]);
-                            }
-                        }
                     }
                 }
             }
@@ -2301,24 +2623,25 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
 
             if (pfds[j].revents & mask) != 0 {
                 if j == sig_idx {
-                    if drain_signal_pipe(sig_fd) {
-                        shutdown = true;
-                        break;
+                    if let Some(sig) = drain_signal_pipe(sig_fd) {
+                        if sig == libc::SIGTERM || sig == libc::SIGINT {
+                            shutdown = true;
+                            break;
+                        }
+                        if sig == libc::SIGHUP {
+                            reload_needed = true;
+                        }
                     }
                 } else if j == ctrl_idx {
                     let client = unsafe { libc::accept(ctrl_fd, ptr::null_mut(), ptr::null_mut()) };
                     if client >= 0 {
-                        unsafe {
-                            set_cloexec(client);
-                        }
+                        unsafe { set_cloexec(client) };
                         let mut cmd_buf = [0u8; CMD_BUF];
                         let nr = read_all_nonblock(client, &mut cmd_buf);
                         if nr > 0 {
                             handle_control_command(client, &cmd_buf[..nr as usize], services);
                         }
-                        unsafe {
-                            close_fd(client);
-                        }
+                        unsafe { close_fd(client) };
                     }
                 } else {
                     let idx = map_service[j];
@@ -2340,7 +2663,21 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         let mut sock_path = Path::from_bytes(root.as_bytes());
         sock_path.push(SOCK_SUFFIX);
         libc::unlink(sock_path.as_ptr());
+        close_fd(SUPERVISOR_LOG_FD);
+        SUPERVISOR_LOG_FD = -1;
     }
 
     0
 }
+
+#[used]
+#[unsafe(link_section = ".license")]
+static LICENSE: [u8; 436] = *b"\
+svc-rs Copyright (c) 2026 Semyon Tsarev
+This project is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+project, You can obtain one at https://mozilla.org/MPL/2.0/.
+This project is \"Incompatible With Secondary Licenses\",
+as defined by the Mozilla Public License, v. 2.0.
+You can download the source code from:
+https://github.com/SemyonTs/svc-rs/archive/refs/heads/main.zip\x00";
