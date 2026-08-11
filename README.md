@@ -1,4 +1,6 @@
 # svc-rs
+[![Crates.io](https://img.shields.io/crates/v/svc-rs)](https://crates.io/crates/svc-rs)
+[![License](https://img.shields.io/crates/l/svc-rs)](https://crates.io/crates/svc-rs)
 
 **Supervisor for long‑running processes** – a lightweight, no‑std daemon‑style service manager inspired by daemontools and s6.
 
