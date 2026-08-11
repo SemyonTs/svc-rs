@@ -8,7 +8,7 @@ authors = ["Semyon Tsarev"]
 repository = "https://github.com/SemyonTs/svc-rs"
 readme = "README.md"
 keywords = ["supervisor", "daemon", "service", "manager", "process"]
-categories = ["command-line-utilities", "system"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "svc"
