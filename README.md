@@ -200,8 +200,9 @@ When the supervisor receives `SIGTERM` or `SIGINT`:
 
 ## License
 
-`svc-rs` is licensed under the **Mozilla Public License 2.0** and is **Incompatible With Secondary Licenses**.  
-The full license text is embedded in the binary (`.license` section).
+`svc-rs` is licensed under the **Mozilla Public License 2.0** and is **Incompatible With Secondary Licenses**. 
+See LICENSE and NOTICE before use.
+Short notice text is embedded in the binary (`.license` section).
 
 ---
 
