@@ -12,7 +12,7 @@ categories = ["command-line-utilities"]
 
 [[bin]]
 name = "svc"
-path = "main.rs"
+path = "src/main.rs"
 
 [dependencies]
 libc = { version = "0.2", default-features = false }
